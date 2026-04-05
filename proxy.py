@@ -56,24 +56,45 @@ for ext in ENABLED_EXTENSIONS:
 
 @app.route("/cached_image/<path:filename>")
 def serve_cached_image(filename):
-	return send_from_directory(CACHE_DIR, filename, mimetype='image/gif')
+    full_path = os.path.join(CACHE_DIR, filename)
+    if not os.path.exists(full_path):
+        return abort(404)
+
+    file_size = os.path.getsize(full_path)
+    with open(full_path, "rb") as f:
+        data = f.read()
+
+    # We manually build the response to ensure NO CHUNKING
+    resp = Response(data, mimetype='image/gif')
+    
+    resp.headers['Content-Length'] = str(file_size)
+    resp.headers['Content-Type'] = 'image/gif'
+    resp.headers['Content-Encoding'] = 'identity'
+    resp.headers['Transfer-Encoding'] = 'identity'
+    resp.headers['Connection'] = 'close'
+    resp.headers['Content-Disposition'] = 'inline'
+
+    print(f"[proxy] Serving Bin-Safe GIF: {filename} ({file_size} bytes)")
+    return resp
 
 def handle_image_request(url):
-	# Pass config values to fetch_and_cache_image
-	cached_url = fetch_and_cache_image(
-		url,
-		resize=config.RESIZE_IMAGES,
-		max_width=config.MAX_IMAGE_WIDTH,
-		max_height=config.MAX_IMAGE_HEIGHT,
-		convert=config.CONVERT_IMAGES,
-		convert_to=config.CONVERT_IMAGES_TO_FILETYPE,
-		dithering=config.DITHERING_ALGORITHM
-	)
-	if cached_url:
-		return send_from_directory(CACHE_DIR, os.path.basename(cached_url), mimetype='image/gif')
-	else:
-		return abort(404, "Image not found or could not be processed")
-
+    # Pass config values to fetch_and_cache_image
+    cached_url = fetch_and_cache_image(
+        url,
+        resize=config.RESIZE_IMAGES,
+        max_width=config.MAX_IMAGE_WIDTH,
+        max_height=config.MAX_IMAGE_HEIGHT,
+        convert=config.CONVERT_IMAGES,
+        convert_to=config.CONVERT_IMAGES_TO_FILETYPE,
+        dithering=config.DITHERING_ALGORITHM
+    )
+    if cached_url:
+        # CRITICAL FIX: Use serve_cached_image instead of send_from_directory
+        # This ensures the Content-Length and GIF87a alignment is preserved
+        return serve_cached_image(os.path.basename(cached_url))
+    else:
+        return abort(404, "Image not found or could not be processed")
+    
 @app.route("/", defaults={"path": "/"}, methods=["GET", "POST"])
 @app.route("/<path:path>", methods=["GET", "POST"])
 def handle_request(path):
@@ -160,24 +181,23 @@ def process_response(response, url):
 		headers = {}
 
 	content_type = headers.get('Content-Type', '').lower()
-	print(f"Content-Type: {content_type}")
-
+    
+    # IMAGE HANDLING
 	if content_type.startswith('image/'):
-		# For image content, use the fetch_and_cache_image function with config values
+		print(f"[proxy] Intercepted image stream for: {url}")
 		cached_url = fetch_and_cache_image(
-			url,
-			content,
-			resize=config.RESIZE_IMAGES,
-			max_width=config.MAX_IMAGE_WIDTH,
-			max_height=config.MAX_IMAGE_HEIGHT,
-			convert=config.CONVERT_IMAGES,
-			convert_to=config.CONVERT_IMAGES_TO_FILETYPE,
-			dithering=config.DITHERING_ALGORITHM
-		)
+            url,
+            content,
+            resize=config.RESIZE_IMAGES,
+            max_width=config.MAX_IMAGE_WIDTH,
+            max_height=config.MAX_IMAGE_HEIGHT,
+            convert=config.CONVERT_IMAGES,
+            convert_to=config.CONVERT_IMAGES_TO_FILETYPE,
+            dithering=config.DITHERING_ALGORITHM
+        )
 		if cached_url:
-			return send_from_directory(CACHE_DIR, os.path.basename(cached_url), mimetype='image/gif')
-		else:
-			return abort(404, "Image could not be processed")
+			return serve_cached_image(os.path.basename(cached_url))
+		return abort(404)
 
 	# Handle CSS and JavaScript
 	if content_type in ['text/css', 'text/javascript', 'application/javascript', 'application/x-javascript']:
@@ -239,13 +259,16 @@ def process_response(response, url):
 	else:
 		print(f"Content type {content_type} should not be transcoded, passing through unchanged")
 
-	response = Response(content, status_code)
+	resp_out = Response(content, status_code)
 	for key, value in headers.items():
 		if key.lower() not in ["content-encoding", "content-length", "transfer-encoding"]:
-			response.headers[key] = value
+			resp_out.headers[key] = value
+    
+    # Force the connection closed for vintage browsers
+	resp_out.headers['Connection'] = 'close'
 
 	print("Finished processing response")
-	return response
+	return resp_out
 
 def handle_default_request():
 	url = request.url.replace("https://", "http://", 1)

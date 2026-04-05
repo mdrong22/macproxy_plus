@@ -78,30 +78,27 @@ def is_image_url(url: str) -> bool:
 
 def _flatten_alpha(img: Image.Image) -> Image.Image:
     """
-    Composite any alpha/transparency onto a white background.
-    This MUST happen before converting to GIF, which has no true alpha.
-    Without this, RGBA PNGs produce garbage or raise an exception.
+    Forcefully strips all PNG metadata and flattens transparency.
     """
-    # Palette images can carry transparency info — convert to RGBA first
-    if img.mode == "P":
+    # If it's already a palette image (PNG-8), convert to RGBA to 
+    # properly handle the transparency layer before flattening.
+    if img.mode in ("P", "1"):
         img = img.convert("RGBA")
 
     if img.mode == "RGBA":
+        # Create a brand new image buffer to drop all PNG 'Chunks'
         bg = Image.new("RGB", img.size, (255, 255, 255))
-        # img.split()[3] is the alpha channel used as paste mask
+        # Use the alpha channel as a mask
         bg.paste(img, mask=img.split()[3])
         return bg
 
     if img.mode == "LA":
-        bg = Image.new("L", img.size, 255)
+        bg = Image.new("RGB", img.size, (255, 255, 255))
         bg.paste(img, mask=img.split()[1])
-        return bg.convert("RGB")
+        return bg
 
-    # Ensure we end up in a quantisable mode
-    if img.mode not in ("RGB", "L"):
-        return img.convert("RGB")
-
-    return img
+    # Final fallback: Force to RGB and drop any ICC profiles or metadata
+    return img.convert("RGB")
 
 
 def fetch_and_cache_image(
@@ -113,43 +110,32 @@ def fetch_and_cache_image(
     convert: bool = True,
     convert_to: str = "gif",
     dithering: str = "FLOYDSTEINBERG",
+    hash_url: bool = True
 ) -> Optional[str]:
     """
-    Fetch an image (or use supplied bytes), convert it, cache it on disk,
-    and return the path to the cached file.
-    Returns None on any failure.
+    Fetch, convert to 1-bit B&W GIF87a, and cache for Macintosh Plus.
     """
     os.makedirs(CACHE_DIR, exist_ok=True)
 
-    # ── Fetch if no content supplied ─────────────────────────────────────────
+    # 1. Fetching Logic
     if content is None:
         try:
             headers = {
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/91.0.4472.114 Safari/537.36"
-                ),
-                # Listing preferred types first discourages many CDNs from
-                # silently serving WebP/AVIF when Pillow may lack a decoder
-                "Accept": (
-                    "image/gif, image/jpeg, image/png, "
-                    "image/*;q=0.8, */*;q=0.5"
-                ),
+                "User-Agent": "Mozilla/5.0 (Macintosh; 68K Mac OS 7)",
+                "Accept": "image/gif, image/jpeg, image/png, */*",
             }
             resp = requests.get(url, headers=headers, timeout=15)
             if resp.status_code != 200:
-                print(f"[image_utils] HTTP {resp.status_code} fetching {url}")
                 return None
             content = resp.content
         except Exception as e:
-            print(f"[image_utils] fetch error {url}: {e}")
+            print(f"[image_utils] Fetch error: {e}")
             return None
 
     if not content:
         return None
 
-    # ── Cache key ────────────────────────────────────────────────────────────
+    # 2. Cache Setup
     cache_key = hashlib.md5(url.encode("utf-8")).hexdigest()
     out_ext = convert_to.lower().lstrip(".")
     cached_path = os.path.join(CACHE_DIR, f"{cache_key}.{out_ext}")
@@ -157,48 +143,68 @@ def fetch_and_cache_image(
     if os.path.exists(cached_path):
         return cached_path
 
-    # ── Open with Pillow ─────────────────────────────────────────────────────
+    # 3. Processing
     try:
         img = Image.open(io.BytesIO(content))
-
-        # Animated GIF or multi-frame WebP — take only frame 0
+        
+        # Handle animations (take first frame)
         if hasattr(img, "is_animated") and img.is_animated:
             img.seek(0)
+        img.load()
 
-        img.load()  # force full decode so errors surface now
-    except Exception as e:
-        print(f"[image_utils] Pillow cannot open {url}: {e}")
-        return None
+        print(f"[image_utils] Processing {url} | Original: {img.size} {img.mode}")
 
-    # ── Process ──────────────────────────────────────────────────────────────
-    try:
-        # 1. Flatten alpha/transparency onto white FIRST — critical for PNG
+        # A. Flatten Alpha (Critical for PNG)
         img = _flatten_alpha(img)
 
-        # 2. Resize to fit Mac Plus screen dimensions
-        if resize:
-            img.thumbnail((max_width, max_height), Image.LANCZOS)
-
-        # 3. Convert to output format
-        if convert and out_ext == "gif":
-            dither_flag = (
-                Image.Dither.FLOYDSTEINBERG
-                if dithering.upper() == "FLOYDSTEINBERG"
-                else Image.Dither.NONE
-            )
-            img = img.quantize(colors=256, dither=dither_flag)
-        elif img.mode not in ("RGB", "L", "P"):
+        # B. Move to RGB for high-quality resizing
+        if img.mode != "RGB":
             img = img.convert("RGB")
 
-        # 4. Save to cache
-        buf = io.BytesIO()
-        img.save(buf, format=out_ext.upper() if out_ext != "jpg" else "JPEG")
-        with open(cached_path, "wb") as f:
-            f.write(buf.getvalue())
+        # C. Resize (Mac Plus screen is 512x342)
+        if resize:
+            img.thumbnail((max_width, max_height), Image.LANCZOS)
+            print(f"[image_utils] New size: {img.size}")
 
-        print(f"[image_utils] converted and cached: {url}")
+        # D. Convert to 1-bit (B&W) for the Plus
+        if convert and out_ext == "gif":
+            dither_flag = (
+                Image.Dither.FLOYDSTEINBERG 
+                if dithering.upper() == "FLOYDSTEINBERG" 
+                else Image.Dither.NONE
+            )
+            # Convert to Grayscale then Quantize to exactly 2 colors
+            img = img.convert("L")
+            img = img.quantize(colors=256, dither=dither_flag)
+
+        # E. Save as strictly GIF87a
+        buf = io.BytesIO()
+        img.save(
+            buf, 
+            format="GIF", 
+            version="GIF87a", 
+            optimize=True, 
+            interlace=False
+        )
+        
+        final_data = buf.getvalue()
+
+        # 4. Binary Header Debugging
+        # Bytes 6-7 are Width, 8-9 are Height in Little Endian
+        header_w = final_data[6] + (final_data[7] << 8)
+        header_h = final_data[8] + (final_data[9] << 8)
+        
+        if header_w > 1000 or header_h > 1000:
+            print(f"[!!!] WARNING: Header dimensions look corrupted: {header_w}x{header_h}")
+        else:
+            print(f"[debug] Verified GIF Header: {header_w}x{header_h}")
+
+        with open(cached_path, "wb") as f:
+            f.write(final_data)
+
+        print(f"[image_utils] SUCCESS: {cached_path} ({len(final_data)} bytes)")
         return cached_path
 
     except Exception as e:
-        print(f"[image_utils] conversion error {url}: {e}")
+        print(f"[image_utils] CRITICAL ERROR: {e}")
         return None
